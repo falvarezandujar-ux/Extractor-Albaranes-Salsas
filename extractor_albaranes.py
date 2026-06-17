@@ -169,8 +169,11 @@ def procesar():
 
         # primero calculo el destino, luego muevo, y la ruta del Excel ya apunta al destino
         destino = destino_unico(carpeta_proc, os.path.basename(ruta_pdf))
+        nombre_dest = os.path.basename(destino)
+        # ruta RELATIVA al Excel (que se guarda en la carpeta de trabajo): mas robusta en OneDrive
+        ruta_rel = os.path.join(CARPETA_PROCESADOS, nombre_dest)
         for f in filas_pdf:
-            f.update({"archivo": os.path.basename(destino), "ruta": os.path.abspath(destino)})
+            f.update({"archivo": nombre_dest, "ruta_rel": ruta_rel})
             filas.append(f)
         shutil.move(ruta_pdf, destino)
 
@@ -199,15 +202,15 @@ def escribir_excel(filas):
     for f in filas:
         ws.append([f["codigo_interno"], f["desc_interna"], f["lote"], f["cantidad"],
                    f["s_pedido"], f["num_albaran"], f["fecha"], f["cliente"], f["descripcion"],
-                   f["articulo_prov"], f["archivo"], f["pagina"], "Ver albarán"])
+                   f["articulo_prov"], f["archivo"], f["pagina"], f'Ver albarán (pág. {f["pagina"]})'])
         r = ws.max_row
         for c in range(1, len(cabeceras)+1):
             ws.cell(row=r, column=c).font = Font(name="Arial", size=10)
             ws.cell(row=r, column=c).border = borde
         if not f["codigo_interno"]:                      # sin codigo -> resaltar para revisar
             ws.cell(row=r, column=1).fill = ROJO
-        enlace = ws.cell(row=r, column=len(cabeceras))   # enlace al PDF, saltando a la pagina
-        enlace.hyperlink = f'{f["ruta"]}#page={f["pagina"]}'
+        enlace = ws.cell(row=r, column=len(cabeceras))   # enlace RELATIVO al PDF archivado
+        enlace.hyperlink = f["ruta_rel"]
         enlace.font = Font(name="Arial", size=10, color="0563C1", underline="single")
 
     anchos = [16, 26, 14, 12, 14, 12, 12, 12, 36, 14, 26, 6, 14]
