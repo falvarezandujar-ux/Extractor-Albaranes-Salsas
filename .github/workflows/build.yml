@@ -1,0 +1,46 @@
+name: Construir EXE
+
+# Se ejecuta solo al subir cambios, o a mano desde la pestana "Actions" (boton "Run workflow")
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'extractor_albaranes.py'
+      - 'requirements.txt'
+      - '.github/workflows/build.yml'
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - name: Descargar el codigo del repositorio
+        uses: actions/checkout@v4
+
+      - name: Instalar Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Instalar librerias de Python
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt pyinstaller
+
+      - name: Instalar Tesseract (motor OCR)
+        run: choco install tesseract --confirm --no-progress
+
+      - name: Anadir el idioma espanol a Tesseract
+        run: Invoke-WebRequest -Uri "https://github.com/tesseract-ocr/tessdata/raw/main/spa.traineddata" -OutFile "C:/Program Files/Tesseract-OCR/tessdata/spa.traineddata"
+
+      - name: Construir el EXE (Tesseract + espanol incrustados)
+        run: |
+          pyinstaller --onefile --name ExtractorAlbaranes `
+            --add-data "C:/Program Files/Tesseract-OCR;Tesseract-OCR" `
+            --hidden-import fitz `
+            extractor_albaranes.py
+
+      - name: Publicar el EXE para descargar
+        uses: actions/upload-artifact@v4
+        with:
+          name: ExtractorAlbaranes-Windows
+          path: dist/ExtractorAlbaranes.exe
