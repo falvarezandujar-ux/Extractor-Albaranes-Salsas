@@ -1,143 +1,179 @@
 # -*- coding: utf-8 -*-
 """
-Extractor de albaranes (Sección Salsas) por OCR.
-- Lee todos los PDF de una carpeta.
-- En cada PDF localiza SOLO las paginas de ALBARAN (ignora COA, lavado EFTCO y bascula).
-- Extrae: Nº albaran, fecha, cliente, descripcion, lote, cantidad y Nº de pedido (S/Pedido).
-- Cruza la descripcion / codigo de proveedor con un MAESTRO para asignar VUESTRO codigo interno.
-- Vuelca una linea por articulo a un Excel, con enlace directo a la pagina del PDF.
+Extractor de albaranes v2 (Seccion Salsas).
+NUEVA LOGICA: en vez de mantener un maestro a mano, se cruza el Nº DE PEDIDO (45........)
+que SI aparece en el albaran contra el Excel de PEDIDOS pendientes (que trae TU codigo MMPP).
+
+Flujo:
+  1) MASTER de pedidos: se acumulan las lineas del/los Excel de pedidos descargados
+     (pedidos_master.csv). Cada vez que dejas un Excel nuevo de pedidos, se fusionan las
+     lineas nuevas sin duplicar (clave pedido+pos+material).
+  2) Se leen los PDF de albaranes, se ignora COA/lavado/cupaje/transporte, y de cada albaran
+     se saca el Nº de pedido, se busca en el master y se asigna el codigo MMPP + descripcion.
+  3) Se vuelca a Excel una linea por albaran, con lote/cantidad (lo mejor que da el OCR) y
+     enlace al PDF archivado. Lo que no cuadra, en rojo/ambar, para revisar.
 """
-import os, re, io, csv, glob, sys, shutil
-import fitz                      # PyMuPDF: rasteriza el PDF
-import pytesseract               # motor OCR (Tesseract)
+import os, re, io, csv, glob, sys, shutil, unicodedata
+import fitz, pytesseract
 from PIL import Image
+import openpyxl
 from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 
-# ============================================================
-# CONFIGURACION  (lo unico que normalmente tocaras)
-# ============================================================
-CARPETA_PDF   = "."                      # carpeta donde caen los PDF (en produccion: ruta de OneDrive)
-CARPETA_PROCESADOS = "ALBARANES PROCESADOS"  # subcarpeta a la que se mueve el PDF ya leido
-MAESTRO_CSV   = "maestro_codigos.csv"     # tabla clave -> codigo interno (la mantienes tu)
-SALIDA_XLSX   = "Albaranes_Salsas.xlsx"   # Excel resultado
-IDIOMA_OCR    = "spa"
-DPI           = 300
-# Si Tesseract no esta en el PATH (Windows), descomenta y ajusta:
-# pytesseract.pytesseract.tesseract_cmd = r"C:\Tesseract\tesseract.exe"
+# ===================== CONFIGURACION =====================
+CARPETA_PDF        = "."
+CARPETA_PROCESADOS = "ALBARANES PROCESADOS"
+MASTER_CSV         = "pedidos_master.csv"          # base acumulada de pedidos (la gestiona el programa)
+PATRON_PEDIDOS_XLSX = "Pedidos*.xlsx"              # Excel(s) de pedidos que tu descargas y dejas en la carpeta
+SALIDA_XLSX        = "Albaranes_Salsas.xlsx"
+IDIOMA_OCR, DPI    = "spa", 300
+# pytesseract.pytesseract.tesseract_cmd = r"C:\Tesseract\tesseract.exe"   # si hiciera falta
 
 def _resolver_tesseract():
-    """Localiza Tesseract tanto si va incrustado en el .exe como si esta instalado en el PC."""
     base = getattr(sys, "_MEIPASS", "")
-    candidatos = [
-        os.path.join(base, "Tesseract-OCR", "tesseract.exe") if base else "",
-        r"C:\Program Files\Tesseract-OCR\tesseract.exe",
-        r"C:\Program Files (x86)\Tesseract-OCR\tesseract.exe",
-    ]
-    for c in candidatos:
+    for c in [os.path.join(base, "Tesseract-OCR", "tesseract.exe") if base else "",
+              r"C:\Program Files\Tesseract-OCR\tesseract.exe",
+              r"C:\Program Files (x86)\Tesseract-OCR\tesseract.exe"]:
         if c and os.path.exists(c):
             pytesseract.pytesseract.tesseract_cmd = c
             td = os.path.join(os.path.dirname(c), "tessdata")
-            if os.path.isdir(td):
-                os.environ["TESSDATA_PREFIX"] = td
+            if os.path.isdir(td): os.environ["TESSDATA_PREFIX"] = td
             return
-    # si no se encuentra, se confia en que 'tesseract' este en el PATH
 
+def _norm(s):
+    s = unicodedata.normalize("NFKD", str(s))
+    return "".join(c for c in s if not unicodedata.combining(c)).upper()
 
-# ============================================================
-# CLASIFICACION DE PAGINAS POR PALABRAS CLAVE
-# ============================================================
+# ===================== MASTER DE PEDIDOS =====================
+def parsear_excel_pedidos(ruta):
+    """Lee un Excel de pedidos (cabecera con 'Doc.compr.' y 'Material') y devuelve lineas."""
+    wb = openpyxl.load_workbook(ruta, data_only=True)
+    ws = wb.worksheets[0]
+    col, fila_cab = {}, None
+    for r in range(1, 15):
+        valores = {(_norm(ws.cell(r, c).value) if ws.cell(r, c).value else ""): c
+                   for c in range(1, ws.max_column + 1)}
+        if "DOC.COMPR." in valores and "MATERIAL" in valores:
+            fila_cab = r
+            col = {"pedido": valores.get("DOC.COMPR."),
+                   "proveedor": valores.get("PROVEEDOR/CENTRO SUMINISTRADOR"),
+                   "material": valores.get("MATERIAL"),
+                   "texto": valores.get("TEXTO BREVE"),
+                   "cantidad": valores.get("CANTIDAD"),
+                   "pos": valores.get("POS.")}
+            break
+    if not fila_cab:
+        return []
+    lineas = []
+    for r in range(fila_cab + 1, ws.max_row + 1):
+        ped = ws.cell(r, col["pedido"]).value
+        mat = ws.cell(r, col["material"]).value if col["material"] else None
+        if not ped or not mat:
+            continue
+        lineas.append({"pedido": str(ped).strip(), "material": str(mat).strip(),
+                       "texto": str(ws.cell(r, col["texto"]).value or "").strip(),
+                       "proveedor": str(ws.cell(r, col["proveedor"]).value or "").strip(),
+                       "cantidad": str(ws.cell(r, col["cantidad"]).value or "").strip(),
+                       "pos": str(ws.cell(r, col["pos"]).value or "").strip()})
+    return lineas
+
+def actualizar_master():
+    """Fusiona en el master las lineas de los Excel de pedidos presentes, sin duplicar."""
+    master = {}
+    if os.path.exists(MASTER_CSV):
+        with open(MASTER_CSV, encoding="utf-8-sig") as f:
+            for row in csv.DictReader(f, delimiter=";"):
+                master[(row["pedido"], row["pos"], row["material"])] = row
+    nuevos = 0
+    for xls in glob.glob(os.path.join(CARPETA_PDF, PATRON_PEDIDOS_XLSX)):
+        for ln in parsear_excel_pedidos(xls):
+            k = (ln["pedido"], ln["pos"], ln["material"])
+            if k not in master:
+                master[k] = ln; nuevos += 1
+    if master:
+        with open(MASTER_CSV, "w", encoding="utf-8-sig", newline="") as f:
+            w = csv.DictWriter(f, fieldnames=["pedido", "pos", "material", "texto", "proveedor", "cantidad"], delimiter=";")
+            w.writeheader()
+            for v in master.values():
+                w.writerow({k: v.get(k, "") for k in w.fieldnames})
+    indice = {}
+    for v in master.values():
+        indice.setdefault(v["pedido"], []).append(v)
+    print(f"Master de pedidos: {len(master)} lineas ({nuevos} nuevas). Pedidos distintos: {len(indice)}")
+    return indice
+
+# ===================== CLASIFICACION =====================
 def tipo_de_pagina(texto):
-    t = texto.upper()
-    if "ALBARAN" in t or "ALBARÁN" in t:
-        return "ALBARAN"
-    if "INFORME ANAL" in t:           # COA / Informe Analitico
+    t = _norm(texto)
+    es_coa = (re.search(r"CERTIFICAD\w*\s+DE\s+ANALI", t) or re.search(r"CERTIFICATE\s+OF\s+ANALY", t)
+              or "ANALYSIS CERTIFICATE" in t or "INFORME ANALITICO" in t)
+    if es_coa:
         return "COA"
-    if "EFTCO" in t or "DOCUMENTO DE LAVADO" in t:
+    if "EFTCO" in t or "DOCUMENTO DE LAVADO" in t or "LAVADO DE CISTERNA" in t:
         return "LAVADO"
-    if "BASCULA" in t or "BÁSCULA" in t or "Nº TICKET" in t or "N? TICKET" in t:
-        return "BASCULA"
+    if "CUPAJE" in t:
+        return "CUPAJE"
+    if "ALBARAN TRANSPORTE" in t or "ALBARAN DE TRANSPORTE" in t:
+        return "TRANSPORTE"
+    if "ALBARAN" in t or "DELIVERY NOTE" in t:
+        return "ALBARAN"
     return "OTRO"
 
-# ============================================================
-# OCR
-# ============================================================
-def ocr_pagina(page, dpi=DPI, psm=None):
-    pix = page.get_pixmap(dpi=dpi)
-    img = Image.open(io.BytesIO(pix.tobytes("png")))
-    cfg = f"--psm {psm}" if psm else ""
-    return pytesseract.image_to_string(img, lang=IDIOMA_OCR, config=cfg), img
+# ===================== EXTRACCION =====================
+def extraer_pedido(texto):
+    m = re.search(r"\b(45\d{8})\b", texto)
+    if m: return m.group(1)
+    m = re.search(r"4\s?5\s?\d(?:\s?\d){7}", texto)
+    return re.sub(r"\s", "", m.group(0)) if m else ""
 
-def ocr_banda(img, top, bot):
-    """OCR de una banda horizontal (fraccion de alto) — util para tablas con bordes."""
-    w, h = img.size
-    crop = img.crop((0, int(h*top), w, int(h*bot)))
-    return pytesseract.image_to_string(crop, lang=IDIOMA_OCR, config="--psm 6")
+def extraer_lote(texto):
+    for pat in [r"N[ºo°]?\s*lote[:\s]*([A-Z0-9][A-Z0-9\-/]{3,})",
+                r"LOTE/SERIE\s+(\d{1,4}/\d{2})",
+                r"BATCH[:\s]*([A-Z0-9][A-Z0-9\-/]{3,})",
+                r"LOTE\s+(?:BRENNTAG|FABRICANTE)\s+([A-Z0-9]{5,})",
+                r"LOTE[:/\s]*([A-Z0-9][A-Z0-9\-/]{3,})"]:
+        for m in re.finditer(pat, texto, re.I):
+            val = m.group(1).strip(" .|")
+            if re.search(r"\d", val):          # un lote real lleva algun digito
+                return val
+    return ""
 
-# ============================================================
-# MAESTRO  clave -> (codigo_interno, descripcion_interna)
-# ============================================================
-def cargar_maestro(ruta):
-    m = {}
-    if not os.path.exists(ruta):
-        return m
-    with open(ruta, encoding="utf-8-sig") as f:
-        for fila in csv.DictReader(f, delimiter=";"):
-            clave = fila["clave"].strip().upper()
-            m[clave] = (fila["codigo_interno"].strip(), fila.get("descripcion_interna", "").strip())
-    return m
+def extraer_cantidad(texto):
+    for pat in [r"(\d{1,3}(?:\.\d{3})*,\d{2})\s*KG", r"(\d{1,3}(?:\.\d{3})+)\s*KG", r"(\d+,\d{2})\s*KG"]:
+        m = re.search(pat, texto, re.I)
+        if m: return m.group(1)
+    return ""
 
-def asignar_codigo(maestro, articulo_prov, descripcion):
-    """1º intenta el codigo de proveedor exacto; 2º busca cualquier clave dentro de la descripcion."""
-    if articulo_prov and articulo_prov.upper() in maestro:
-        return maestro[articulo_prov.upper()]
-    desc = (descripcion or "").upper()
-    for clave, val in maestro.items():
-        if clave in desc:
-            return val
-    return ("", "")   # sin coincidencia -> se marcara en rojo
+# ===================== EMPAREJAMIENTO =====================
+def emparejar(pedido, texto_albaran, indice):
+    lineas = indice.get(pedido)
+    if not lineas:
+        return None
+    if len({l["material"] for l in lineas}) == 1:
+        l = lineas[0]
+        return {"material": l["material"], "texto": l["texto"], "proveedor": l["proveedor"],
+                "cant_pedido": l["cantidad"], "confianza": "alta"}
+    T = _norm(texto_albaran)
+    def score(l):
+        toks = [w for w in re.split(r"[^A-Z0-9]+", _norm(l["texto"])) if len(w) >= 4]
+        return sum(1 for w in toks if w in T)
+    mejor = max(lineas, key=score)
+    return {"material": mejor["material"], "texto": mejor["texto"], "proveedor": mejor["proveedor"],
+            "cant_pedido": mejor["cantidad"], "confianza": "media" if score(mejor) > 0 else "baja"}
 
-# ============================================================
-# EXTRACCION DE CAMPOS DE UN ALBARAN
-# ============================================================
-def buscar(patron, texto, grupo=1, flags=0):
-    m = re.search(patron, texto, flags)
-    return m.group(grupo).strip() if m else ""
+# ===================== OCR =====================
+def ocr_pagina(page):
+    pix = page.get_pixmap(dpi=DPI)
+    return pytesseract.image_to_string(Image.open(io.BytesIO(pix.tobytes("png"))), lang=IDIOMA_OCR)
 
-def extraer_albaran(texto_full, img):
-    cab = ocr_banda(img, 0.20, 0.28)   # banda FECHA/NUMERO/CLIENTE/NIF
+def ocr_cabecera(page):
+    pix = page.get_pixmap(dpi=400)
+    img = Image.open(io.BytesIO(pix.tobytes("png"))); w, h = img.size
+    crop = img.crop((0, 0, w, int(h * 0.30)))
+    return pytesseract.image_to_string(crop, lang=IDIOMA_OCR, config="--psm 11")
 
-    fecha   = buscar(r"\b(\d{2}/\d{2}/\d{2,4})\b", cab)
-    if len(fecha) == 8:                # 08/06/26 -> 08/06/2026
-        fecha = fecha[:6] + "20" + fecha[6:]
-    num_alb = buscar(r"\b(SF\s*\d{2,4})\b", cab).replace("  ", " ")
-    cliente = buscar(r"\b(\d{8})\b", cab)
-    nif     = buscar(r"\b([A-Z]\d{8})\b", cab)
-
-    # S/Pedido (numero de pedido, suele empezar por 45)
-    s_pedido = buscar(r"S\s*/?\s*PEDIDO\s+(\d{6,})", texto_full, flags=re.I) \
-               or buscar(r"\b(45\d{6,})\b", texto_full)
-
-    # Linea de articulo: CODIGO_PROVEEDOR  DESCRIPCION ... LOTE  CANTIDAD ...
-    articulo = buscar(r"\b([A-Z]{3,}[A-Z0-9]*\d{2,})\b\s+VINAGRE", texto_full)
-    descripcion = buscar(r"\b[A-Z]{3,}[A-Z0-9]*\d{2,}\s+(VINAGRE[^\n]+)", texto_full)
-    descripcion = re.sub(r"\s+", " ", descripcion).strip()
-
-    lote     = buscar(r"\b(SF-\d{4,})\b", texto_full)          # formato de lote de este proveedor
-    cantidad = buscar(r"(\d{1,3}(?:\.\d{3})*,\d{2})(?!\d)", texto_full)  # 26.140,00
-    impreso  = buscar(r"(?<!\d)(4\d{5})(?!\d)", texto_full)    # codigo 4xxxxx si viniera impreso
-
-    return [{
-        "num_albaran": num_alb, "fecha": fecha, "cliente": cliente, "nif": nif,
-        "articulo_prov": articulo, "descripcion": descripcion,
-        "lote": lote, "cantidad": cantidad, "s_pedido": s_pedido, "cod_impreso": impreso,
-    }]
-
-# ============================================================
-# PROCESO PRINCIPAL
-# ============================================================
+# ===================== PROCESO =====================
 def destino_unico(carpeta, nombre):
-    """Devuelve una ruta libre en 'carpeta' (evita machacar si ya existe ese nombre)."""
     base, ext = os.path.splitext(nombre)
     dest = os.path.join(carpeta, nombre); n = 2
     while os.path.exists(dest):
@@ -145,77 +181,67 @@ def destino_unico(carpeta, nombre):
     return dest
 
 def procesar():
-    maestro = cargar_maestro(MAESTRO_CSV)
+    indice = actualizar_master()
     carpeta_proc = os.path.join(CARPETA_PDF, CARPETA_PROCESADOS)
     os.makedirs(carpeta_proc, exist_ok=True)
     filas = []
-    # glob no es recursivo: los PDF ya movidos a la subcarpeta NO se vuelven a leer
     for ruta_pdf in sorted(glob.glob(os.path.join(CARPETA_PDF, "*.pdf"))):
-        doc = fitz.open(ruta_pdf)
-        filas_pdf = []
+        doc = fitz.open(ruta_pdf); filas_pdf = []
         for i, page in enumerate(doc):
-            texto, img = ocr_pagina(page)
+            texto = ocr_pagina(page)
             if tipo_de_pagina(texto) != "ALBARAN":
                 continue
-            for art in extraer_albaran(texto, img):
-                cod, desc_int = asignar_codigo(maestro, art["articulo_prov"], art["descripcion"])
-                filas_pdf.append({"pagina": i + 1, "codigo_interno": cod,
-                                  "desc_interna": desc_int, **art})
+            pedido = extraer_pedido(texto) or extraer_pedido(ocr_cabecera(page))
+            match = emparejar(pedido, texto, indice) if pedido else None
+            filas_pdf.append({"pagina": i + 1, "pedido": pedido,
+                              "mmpp": (match or {}).get("material", ""),
+                              "material": (match or {}).get("texto", ""),
+                              "proveedor": (match or {}).get("proveedor", ""),
+                              "cant_pedido": (match or {}).get("cant_pedido", ""),
+                              "lote": extraer_lote(texto), "cantidad": extraer_cantidad(texto),
+                              "estado": "OK" if match and match["confianza"] == "alta"
+                                        else "REVISAR" if match
+                                        else ("PEDIDO NO ENCONTRADO" if pedido else "SIN PEDIDO")})
         doc.close()
-
         if not filas_pdf:
-            print(f"[AVISO] Sin albaranes en {os.path.basename(ruta_pdf)} -> se deja sin mover para revisar")
+            print(f"[AVISO] Sin albaranes en {os.path.basename(ruta_pdf)} -> se deja sin mover")
             continue
-
-        # primero calculo el destino, luego muevo, y la ruta del Excel ya apunta al destino
         destino = destino_unico(carpeta_proc, os.path.basename(ruta_pdf))
-        nombre_dest = os.path.basename(destino)
-        # ruta RELATIVA al Excel (que se guarda en la carpeta de trabajo): mas robusta en OneDrive
-        ruta_rel = os.path.join(CARPETA_PROCESADOS, nombre_dest)
+        rel = os.path.join(CARPETA_PROCESADOS, os.path.basename(destino))
         for f in filas_pdf:
-            f.update({"archivo": nombre_dest, "ruta_rel": ruta_rel})
-            filas.append(f)
+            f.update({"archivo": os.path.basename(destino), "ruta_rel": rel}); filas.append(f)
         shutil.move(ruta_pdf, destino)
-
     escribir_excel(filas)
     return filas
 
-# ============================================================
-# EXCEL
-# ============================================================
+# ===================== EXCEL =====================
 def escribir_excel(filas):
     wb = Workbook(); ws = wb.active; ws.title = "Albaranes"
-    cabeceras = ["Código MMAA/MP", "Descripción (maestro)", "Lote", "Cantidad",
-                 "Nº Pedido", "Nº Albarán", "Fecha", "Cliente", "Descripción albarán",
-                 "Cód. proveedor", "Archivo", "Pág.", "Enlace"]
-    AZUL = PatternFill("solid", start_color="1F4E78")
-    ROJO = PatternFill("solid", start_color="FFC7CE")
-    borde = Border(*[Side(style="thin", color="BFBFBF")]*4)
-    ws.append(cabeceras)
-    for c in range(1, len(cabeceras)+1):
-        cel = ws.cell(row=1, column=c)
-        cel.font = Font(name="Arial", bold=True, color="FFFFFF", size=10)
-        cel.fill = AZUL; cel.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
-        cel.border = borde
+    cab = ["Código MMPP", "Material (pedido)", "Proveedor", "Nº Pedido", "Lote",
+           "Cantidad albarán", "Cant. pedido", "Nº Albarán", "Archivo", "Pág.", "Enlace", "Estado"]
+    AZUL = PatternFill("solid", start_color="1F4E78"); ROJO = PatternFill("solid", start_color="FFC7CE")
+    AMBAR = PatternFill("solid", start_color="FFEB9C")
+    borde = Border(*[Side(style="thin", color="BFBFBF")] * 4)
+    ws.append(cab)
+    for c in range(1, len(cab) + 1):
+        x = ws.cell(1, c); x.font = Font(name="Arial", bold=True, color="FFFFFF", size=10)
+        x.fill = AZUL; x.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True); x.border = borde
     ws.row_dimensions[1].height = 30
-
     for f in filas:
-        ws.append([f["codigo_interno"], f["desc_interna"], f["lote"], f["cantidad"],
-                   f["s_pedido"], f["num_albaran"], f["fecha"], f["cliente"], f["descripcion"],
-                   f["articulo_prov"], f["archivo"], f["pagina"], f'Ver albarán (pág. {f["pagina"]})'])
+        ws.append([f["mmpp"], f["material"], f["proveedor"], f["pedido"], f["lote"],
+                   f["cantidad"], f["cant_pedido"], "", f["archivo"], f["pagina"],
+                   f'Ver albarán (pág. {f["pagina"]})', f["estado"]])
         r = ws.max_row
-        for c in range(1, len(cabeceras)+1):
-            ws.cell(row=r, column=c).font = Font(name="Arial", size=10)
-            ws.cell(row=r, column=c).border = borde
-        if not f["codigo_interno"]:                      # sin codigo -> resaltar para revisar
-            ws.cell(row=r, column=1).fill = ROJO
-        enlace = ws.cell(row=r, column=len(cabeceras))   # enlace RELATIVO al PDF archivado
-        enlace.hyperlink = f["ruta_rel"]
-        enlace.font = Font(name="Arial", size=10, color="0563C1", underline="single")
-
-    anchos = [16, 26, 14, 12, 14, 12, 12, 12, 36, 14, 26, 6, 14]
-    for i, w in enumerate(anchos, 1):
-        ws.column_dimensions[chr(64+i) if i <= 26 else "A"].width = w
+        for c in range(1, len(cab) + 1):
+            ws.cell(r, c).font = Font(name="Arial", size=10); ws.cell(r, c).border = borde
+        if f["estado"] != "OK":
+            grave = ("NO" in f["estado"]) or (f["estado"] == "SIN PEDIDO")
+            ws.cell(r, len(cab)).fill = ROJO if grave else AMBAR
+            ws.cell(r, 1).fill = ROJO if not f["mmpp"] else AMBAR
+        e = ws.cell(r, 11); e.hyperlink = f["ruta_rel"]
+        e.font = Font(name="Arial", size=10, color="0563C1", underline="single")
+    for i, w in enumerate([12, 34, 26, 13, 16, 14, 11, 14, 24, 6, 18, 20], 1):
+        ws.column_dimensions[chr(64 + i)].width = w
     ws.freeze_panes = "A2"
     wb.save(SALIDA_XLSX)
 
@@ -223,11 +249,8 @@ if __name__ == "__main__":
     try:
         _resolver_tesseract()
         res = procesar()
-        print(f"\nProceso terminado. Albaranes/articulos detectados: {len(res)}")
-        print(f"Excel generado: {SALIDA_XLSX}")
-        print(f"Los PDF leidos se han movido a: {CARPETA_PROCESADOS}")
+        print(f"\nProceso terminado. Albaranes detectados: {len(res)}")
+        print(f"Excel: {SALIDA_XLSX}  |  PDF movidos a: {CARPETA_PROCESADOS}")
     except Exception:
-        import traceback
-        print("\n*** Ha ocurrido un error ***")
-        traceback.print_exc()
+        import traceback; print("\n*** ERROR ***"); traceback.print_exc()
     input("\nPulsa Enter para cerrar...")
