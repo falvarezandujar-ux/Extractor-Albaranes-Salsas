@@ -238,7 +238,9 @@ def escribir_excel(filas):
             grave = ("NO" in f["estado"]) or (f["estado"] == "SIN PEDIDO")
             ws.cell(r, len(cab)).fill = ROJO if grave else AMBAR
             ws.cell(r, 1).fill = ROJO if not f["mmpp"] else AMBAR
-        e = ws.cell(r, 11); e.hyperlink = f["ruta_rel"]
+        e = ws.cell(r, 11)
+        destino = f["ruta_rel"].replace('"', '')
+        e.value = f'=HYPERLINK("{destino}","Ver albarán (pág. {f["pagina"]})")'
         e.font = Font(name="Arial", size=10, color="0563C1", underline="single")
     for i, w in enumerate([12, 34, 26, 13, 16, 14, 11, 14, 24, 6, 18, 20], 1):
         ws.column_dimensions[chr(64 + i)].width = w
